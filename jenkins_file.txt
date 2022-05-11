@@ -1,0 +1,344 @@
+def getLastSuccessfulBuildNumber() {
+  def build = Jenkins.instance.getAllItems(Job.class).find {proj ->
+      return (proj.fullName == 'Velocity SE/velocity-core/master')
+  }
+  return build.lastStableBuild.displayName.toString()
+}
+
+properties([
+    parameters([
+        string(name: 'fullBuildName', defaultValue: 'lastSuccessful', description: 'The full build name of the Product version to release. Must include accelerate version and build number. For example: 3.0.0.123'),
+    ])
+])
+
+def teamsWebhookUrl = "https://outlook.office.com/webhook/162434eb-cd28-4a23-9e0c-500cfe92147f@189de737-c93a-4f5a-8b68-6f4ca9941912/JenkinsCI/8d279f9fcfa24909a9818e92a5a12ffb/f7b4369e-0cab-4579-8ffa-0140273eb2ca"
+
+node('codebuild-small') {
+    def fullBuild = fullBuildName.equals('lastSuccessful') ? getLastSuccessfulBuildNumber() : fullBuildName
+    def ACCELERATE_VERSION = fullBuild
+    def VELOCITY_VERSION
+    def accelerateInstallerName
+    def velocityInstallerName
+    def accelerateVersionNumWithDashes
+    def velocityVersionNumWithDashes
+    def installerDownloadPath
+    def defaultAccessKey = 'U2FsdGVkX19aIg1spAFIniaQ79UEWiHPFUXzrJiK5OGeXVqD+i6VM1QXRmJgFtKT9aY35F3owfcZhywzXmaWVw=='
+    def harborRegistryAddress = 'https://hclcr.io'
+    def hclHarborCredsId = 'HARBOR_ACCELERATE_ROBOT_ACCOUNT'
+    def dockerHubCreds = 'dockerhub-urbancode-credentials'
+    def hclHarborPrefix = 'hclcr.io/accelerate/'
+    def ibmDockerhubPrefix = 'urbancode/velocity-se-'
+    def isIfix = fullBuild.contains('ifix')
+
+    stage('Prep') {
+        cleanWs()
+        checkout scm
+        //use git instead of 'checkout scm' for debugging from Jenkins pipeline script editor
+        //git branch: 'master',
+        //    credentialsId: 'HCL_Github',
+        //    url: 'git@github01.hclpnp.com:urbancode/ucv-core.git'
+
+        if (ACCELERATE_VERSION.count('.') == 3) {
+            ACCELERATE_VERSION = ACCELERATE_VERSION.substring(0, ACCELERATE_VERSION.lastIndexOf('.'))
+        }
+
+
+        accelerateVersionNumWithDashes = ACCELERATE_VERSION.replaceAll("\\.", "-")
+        accelerateInstallerName = "accelerate-hcl-install-${accelerateVersionNumWithDashes}-linux"
+
+        withAWS(credentials:'aws-velocity-ecr') {
+            def ( s3Bucket, s3Path ) = getS3BucketAndPath(fullBuild)
+            VELOCITY_VERSION = getVersion(s3Bucket, s3Path, fullBuild, 'IBM')
+        }
+        velocityVersionNumWithDashes = VELOCITY_VERSION.replaceAll("\\.", "-")
+        velocityInstallerName = "velocity-ibm-install-${velocityVersionNumWithDashes}-linux"
+
+        currentBuild.displayName = "${ACCELERATE_VERSION} - ${env.BUILD_ID}"
+        currentBuild.description = "Release for build ${fullBuild}, with versions for HCL Accelerate: ${ACCELERATE_VERSION} and UrbanCode Velocity: ${VELOCITY_VERSION}"
+
+        // ensure not releasing an already-released version
+        def existingTag
+        sshagent(['HCL_Github']) {
+            sh 'git fetch --tags'
+            existingTag = sh (
+                script: "git tag -l '${ACCELERATE_VERSION}-release'",
+                returnStdout: true
+            ).trim()
+        }
+        if (existingTag) {
+            error("Version ${ACCELERATE_VERSION} has already been released")
+        }
+    }
+    parallel (
+        'sign job': {
+            stage ('Sign IBM Containers') {
+                build job: 'Velocity SE/Code Signing', parameters: [
+                    [$class: 'StringParameterValue', name: 'buildVersion', value: fullBuild],
+                    [$class: 'StringParameterValue', name: 'velocityVersion', value: VELOCITY_VERSION]
+                ]
+            }
+        },
+        'local': {
+            stage('Docker Start') {
+                sh 'nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2&'
+                sh 'timeout 15 sh -c "until docker info; do echo .; sleep 1; done"'
+            }
+            stage('ECR Login') {
+                withAWS(credentials:'aws-velocity-ecr') {
+                    sh "${ecrLogin()}"
+                }
+            }
+            stage('Download Installers') {
+                withAWS(credentials:'aws-velocity-ecr') {
+                    println "Downloading HCL Accelerate installer for build: $fullBuild, version: $ACCELERATE_VERSION"
+                    s3Download(
+                        file: accelerateInstallerName,
+                        bucket: 'velocity-build-artifacts',
+                        path: "$fullBuild/velocity/orchestration/dist/$accelerateInstallerName",
+                        force: true
+                    )
+                    println "Downloading UrbanCode Velocity installer for build: $fullBuild, version: $VELOCITY_VERSION"
+                    s3Download(
+                        file: velocityInstallerName,
+                        bucket: 'velocity-build-artifacts',
+                        path: "$fullBuild/velocity/orchestration/dist/$velocityInstallerName",
+                        force: true
+                    )
+                }
+            }
+            stage('Install HCL Accelerate') {
+                sh "chmod -R 755 ${accelerateInstallerName}"
+                sh "./${accelerateInstallerName} --silent --initialAdminPassword=admin --license=accept --key=${defaultAccessKey} --location='${WORKSPACE}'"
+                sh 'rm -rf .ucv'
+            }
+            stage('Install UrbanCode Velocity') {
+                sh "chmod -R 755 ${velocityInstallerName}"
+                sh "./${velocityInstallerName} --silent --initialAdminPassword=admin --license=accept --key=${defaultAccessKey} --location='${WORKSPACE}'"
+                sh 'rm -rf .ucv'
+            }
+            stage('Pull & Tag IBM Images') {
+                sh 'chmod +x orchestration/scripts/release/*.sh'
+                sh "./orchestration/scripts/release/pullAndTagImages.sh '${WORKSPACE}/${VELOCITY_VERSION}/docker-compose.yml' ${ibmDockerhubPrefix}"
+            }
+            stage('DockerHub Login') {
+                withCredentials([
+                    usernamePassword(credentialsId: "${dockerHubCreds}", usernameVariable: 'USER', passwordVariable: 'PASS')
+                ]){
+                    sh 'docker login -u $USER -p $PASS'
+                }
+            }
+            stage('Publish IBM Images') {
+                sh "./orchestration/scripts/release/pushImages.sh '${WORKSPACE}/${VELOCITY_VERSION}/docker-compose.yml' ${ibmDockerhubPrefix}"
+            }
+            stage('Pull & Tag HCL Images') {
+                sh "./orchestration/scripts/release/pullAndTagImages.sh '${WORKSPACE}/${ACCELERATE_VERSION}/docker-compose.yml' ${hclHarborPrefix}"
+            }
+            stage('Harbor Login') {
+                withCredentials([
+                    usernamePassword(credentialsId: "${hclHarborCredsId}", usernameVariable: 'USER', passwordVariable: 'PASS')
+                ]){
+                    sh "docker login -u '${USER}' -p ${PASS} ${harborRegistryAddress}"
+                }
+            }
+            stage('Publish HCL Images') {
+                sh "./orchestration/scripts/release/pushImages.sh '${WORKSPACE}/${ACCELERATE_VERSION}/docker-compose.yml' ${hclHarborPrefix}"
+            }
+        }
+    )
+    stage('Download Artifacts') {
+        withAWS(credentials:'aws-velocity-ecr') {
+            s3Download(
+                file: 'dist/',
+                bucket: 'velocity-build-artifacts',
+                path: "$fullBuild/velocity/orchestration/dist/",
+                force: true
+            )
+        }
+        sh 'chmod -R 755 dist'
+        installerDownloadPath = "dist/$fullBuild/velocity/orchestration/dist"
+    }
+    stage('Create Launch/Deploy Component Versions') {
+        // Upload Accelerate bits to HCL Tiger Launch with version ${ACCELERATE_VERSION}_${BUILD_NUMBER}
+        def workspace = pwd()
+        step([$class: 'UCDeployPublisher',
+            siteName: 'New Launch server',
+            component: [
+                $class: 'com.urbancode.jenkins.plugins.ucdeploy.VersionHelper$VersionBlock',
+                componentName: 'UrbanCode Velocity',
+                delivery: [
+                    $class: 'com.urbancode.jenkins.plugins.ucdeploy.DeliveryHelper$Push',
+                    pushVersion: "${ACCELERATE_VERSION}_${BUILD_NUMBER}",
+                    baseDir: "${workspace}/$installerDownloadPath",
+                    fileIncludePatterns: '**/accelerate-*',
+                    fileExcludePatterns: '',
+                    pushDescription: 'Pushed from HCL Jenkins'
+                ],
+            ]
+        ])
+        // Upload Velocity bits to HCL Tiger Launch with version ${VELOCITY_VERSION}_${BUILD_NUMBER}
+        step([$class: 'UCDeployPublisher',
+            siteName: 'New Launch server',
+            component: [
+                $class: 'com.urbancode.jenkins.plugins.ucdeploy.VersionHelper$VersionBlock',
+                componentName: 'UrbanCode Velocity',
+                delivery: [
+                    $class: 'com.urbancode.jenkins.plugins.ucdeploy.DeliveryHelper$Push',
+                    pushVersion: "${VELOCITY_VERSION}_${BUILD_NUMBER}",
+                    baseDir: "${workspace}/$installerDownloadPath",
+                    fileIncludePatterns: '**/velocity-*\n**/signatures/*',
+                    fileExcludePatterns: '',
+                    pushDescription: 'Pushed from HCL Jenkins'
+                ],
+            ]
+        ])
+    }
+    parallel (
+        'ibm-urbancode-ftp': {
+            if (!isIfix) {
+                stage('Upload Artifacts to IBM FTP (urbancode.com)') {
+                    step([$class: 'UCDeployPublisher',
+                        siteName: 'New Launch server',
+                        deploy: [
+                            $class: 'com.urbancode.jenkins.plugins.ucdeploy.DeployHelper$DeployBlock',
+                            deployApp: 'UCV Automated Release',
+                            deployEnv: 'IBM FTP (urbancode.com)',
+                            deployProc: 'Upload to IBM FTP',
+                            deployVersions: "UrbanCode Velocity:${VELOCITY_VERSION}_${BUILD_NUMBER}",
+                            deployOnlyChanged: false,
+                            skipWait: true
+                        ]
+                    ])
+                }
+            }
+        },
+        'hcl-ftp': {
+            if (!isIfix) {
+                stage('Upload Artifacts to HCL FTP (FlexNet)') {
+                    step([$class: 'UCDeployPublisher',
+                        siteName: 'New Launch server',
+                        deploy: [
+                            $class: 'com.urbancode.jenkins.plugins.ucdeploy.DeployHelper$DeployBlock',
+                            deployApp: 'UCV Automated Release',
+                            deployEnv: 'HCL FTP (upload.flexnetoperations.com)',
+                            deployProc: 'Upload to FlexNet FTP',
+                            deployVersions: "UrbanCode Velocity:${ACCELERATE_VERSION}_${BUILD_NUMBER}",
+                            deployOnlyChanged: false,
+                            skipWait: true
+                        ]
+                    ])
+                }
+            }
+        },
+        'hcl-artifactory': {
+            stage('Upload Artifacts to HCL Artifactory') {
+                step([$class: 'UCDeployPublisher',
+                    siteName: 'New Launch server',
+                    deploy: [
+                        $class: 'com.urbancode.jenkins.plugins.ucdeploy.DeployHelper$DeployBlock',
+                        deployApp: 'UCV Automated Release',
+                        deployEnv: 'HCL Artifactory',
+                        deployProc: 'Upload to HCL Artifactory',
+                        deployVersions: "UrbanCode Velocity:${ACCELERATE_VERSION}_${BUILD_NUMBER}",
+                        deployOnlyChanged: false,
+                        skipWait: true
+                    ]
+                ])
+            }
+        },
+        'aws-s3': {
+            stage('Upload to S3') {
+                withAWS(credentials:'aws-velocity-ecr') {
+                    // Upload all files to the internal AWS S3 bucket (velocity-binaries)
+                    s3Upload(file: 'dist', bucket: 'velocity-binaries', path: ACCELERATE_VERSION)
+
+                    // Upload all files to the external, latest AWS S3 bucket (hcl-velocity-binaies)
+                    sh """
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-install-$accelerateVersionNumWithDashes-win.exe s3://hcl-velocity-binaries/accelerate-hcl-install-latest-win.exe --acl public-read
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-install-$accelerateVersionNumWithDashes-linux s3://hcl-velocity-binaries/accelerate-hcl-install-latest-linux --acl public-read
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-install-$accelerateVersionNumWithDashes-macos s3://hcl-velocity-binaries/accelerate-hcl-install-latest-macos --acl public-read
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-offline-install-$accelerateVersionNumWithDashes-win.exe s3://hcl-velocity-binaries/accelerate-hcl-offline-install-latest-win.exe --acl public-read
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-offline-install-$accelerateVersionNumWithDashes-linux s3://hcl-velocity-binaries/accelerate-hcl-offline-install-latest-linux --acl public-read
+                        aws s3 cp $installerDownloadPath/accelerate-hcl-offline-install-$accelerateVersionNumWithDashes-macos s3://hcl-velocity-binaries/accelerate-hcl-offline-install-latest-macos --acl public-read
+                    """
+                }
+            }
+        }
+    )
+    stage('Git Tag') {
+        def COMMIT_HASH = sh (
+            script: "./${accelerateInstallerName} --commit",
+            returnStdout: true
+        ).trim()
+        if (COMMIT_HASH) {
+            sh "git tag ${ACCELERATE_VERSION}-release $COMMIT_HASH"
+            sshagent(['HCL_Github']) {
+                sh "git push origin ${ACCELERATE_VERSION}-release"
+            }
+        }
+    }
+    stage('Notify Teams') {
+        office365ConnectorSend message:"Released HCL Accelerate version ${ACCELERATE_VERSION} and Urbancode Velocity version ${VELOCITY_VERSION}. [Details](http://uc-jkns.prod.hclpnp.com:8080/job/Velocity%20SE/job/Automated%20Release/)", webhookUrl: teamsWebhookUrl
+    }
+    cleanWs()
+}
+
+def getMajorMinorPatchVersion(version) {
+    def versionDigits = version.split(/\./)
+    if (versionDigits.length >= 3) {
+        return "${versionDigits[0]}.${versionDigits[1]}.${versionDigits[2]}" // major.minor.patch
+    }
+    return version
+}
+
+def getS3BucketAndPath(buildNumber) {
+    def releasedInstallersBucket = 'velocity-binaries'
+    def unreleasedInstallersBucket = 'velocity-build-artifacts'
+
+    def releasedBucketFiles = s3FindFiles(
+        bucket: releasedInstallersBucket,
+        glob: "${getMajorMinorPatchVersion(buildNumber)}/${buildNumber}/velocity/orchestration/dist/accelerate-hcl-offline-install-*-linux"
+    )
+
+    println releasedBucketFiles
+    def released = releasedBucketFiles && releasedBucketFiles.length > 0
+
+    // check if exists in unreleased
+    if (!releasedBucketFiles || releasedBucketFiles.length <= 0) {
+        def unreleasedBucketFiles = s3FindFiles(
+            bucket: unreleasedInstallersBucket,
+            glob: "${buildNumber}/velocity/orchestration/dist/accelerate-hcl-offline-install-*-linux"
+        )
+
+        if (!unreleasedBucketFiles || unreleasedBucketFiles.length <= 0) {
+            error("Could not find build '${buildNumber}' in '${releasedInstallersBucket}' or '${unreleasedInstallersBucket}' S3 buckets")
+        }
+        return [
+            unreleasedInstallersBucket,
+            buildNumber
+        ]
+    }
+    return [
+        releasedInstallersBucket,
+        "${getMajorMinorPatchVersion(buildNumber)}/${buildNumber}"
+    ]
+}
+
+def getVersion(s3Bucket, s3Path, buildNumber, brand) {
+    if (brand != 'HCL' && brand != 'IBM') {
+        error("Invalid brand ${brand} specified.")
+    }
+
+    def version
+    def product = brand == 'HCL' ? 'accelerate' : 'velocity'
+
+    def prBucketFiles = s3FindFiles(
+        bucket: s3Bucket,
+        glob: "${s3Path}/velocity/orchestration/dist/${product}-${brand.toLowerCase()}-offline-install-*-linux"
+    )
+    def versionMatch = (prBucketFiles[0].path =~ /install-(.*)-linux/)
+    version = versionMatch[0][1].replace(/-/, '.')
+    version = version.replace('.ifix', '-ifix')
+
+    println "Identified ${brand} ${product} version: '${version}'"
+    return version
+}
